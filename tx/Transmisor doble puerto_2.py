@@ -12,7 +12,6 @@ def send_pam4_to_destinations(pam4_data, destinos):
     for ip, port in destinos:
         send_pam4(ip, port, pam4_data)
 
-
 def send_pam4(ip, port, pam4_data):
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -25,8 +24,8 @@ def send_pam4(ip, port, pam4_data):
 def main():
     # Destinos
     destinos = [
-        ("10.0.2.189", 5000),
-        ("10.0.2.61", 9100)
+        ("10.0.0.48", 5051),
+        ("10.0.1.255", 8100)
     ]
 
     while True:
