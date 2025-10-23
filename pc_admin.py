@@ -7,7 +7,8 @@ CONTROL_PORT = 5050
 esp_conn = None
 esp_addr = None
 esp_lock = threading.Lock()
-modo_error = False
+
+modo_error = False  # Nuevo: estado de error en memoria
 
 def esp_acceptor():
     global esp_conn, esp_addr
@@ -16,6 +17,7 @@ def esp_acceptor():
     server.bind((HOST, CONTROL_PORT))
     server.listen(1)
     print(f"[ADMIN] Esperando conexión de la ESP en {HOST}:{CONTROL_PORT} ...")
+
     while True:
         conn, addr = server.accept()
         with esp_lock:
@@ -36,22 +38,26 @@ def esp_receiver(conn, addr):
             data = conn.recv(2048)
             if not data:
                 break
+
             lines = data.split(b'\n')
             for line in lines:
                 if not line:
                     continue
-                if line.startswith(b'CANAL (original):'):
-                    payload = line[len(b'CANAL (original):'):].strip()
+
+                if line.startswith(b'CANAL (crudo):'):
+                    payload = line[len(b'CANAL (crudo):'):].strip()
                     hex_str = ' '.join(f'{b:02X}' for b in payload)
-                    print("\n🛰️ --- MENSAJE ORIGINAL ---")
+                    print("\n🛰️ --- MENSAJE DEL CANAL (CRUDO) ---")
                     print(hex_str)
                     continue
+
                 if line.startswith(b'CANAL (modulado):'):
                     payload = line[len(b'CANAL (modulado):'):].strip()
                     hex_str = ' '.join(f'{b:02X}' for b in payload)
-                    print("\n🛰️ --- MENSAJE MODULADO ---")
+                    print("\n♻️ --- MENSAJE DEL CANAL (MODULADO) ---")
                     print(hex_str)
                     continue
+
                 if b'[OK]' in line:
                     print("\n[INFO] Reenvío: ✅ Correcto")
                 elif b'[ERROR]' in line:
@@ -64,6 +70,7 @@ def esp_receiver(conn, addr):
                     print("[ADMIN] ✅ Modo error DESACTIVADO")
                 else:
                     print(f"\n[INFO] {line.decode(errors='ignore')}")
+
     except Exception as e:
         print(f"[ERROR] Receiver: {e}")
     finally:
@@ -94,9 +101,10 @@ def main_menu():
         print("IP ESP:", ip)
         print("Modo error actual:", "ACTIVADO ✅" if modo_error else "DESACTIVADO ❌")
         print("1) Solicitar INFO de la ESP")
-        print("2) Activar MODO ERROR")
+        print("2) Activar MODO ERROR (modificación PAM4)")
         print("3) Desactivar MODO ERROR")
         print("4) Salir")
+
         op = input("Opción: ").strip()
         if op == "1":
             enviar_a_esp("info")
