@@ -1,7 +1,7 @@
 # esp_intermedia_monitor.py - MicroPython para ESP32 (nodo intermedio)
 
 import network
-import socket
+import socket   # Un socket es como un "enchufe virtual" de red que permite la comunicación entre dispositivos.
 import time
 import _thread
 import random
@@ -11,20 +11,20 @@ SSID = "UBP"
 PASSWORD = "pascal25"
 
 # --- IPs y puertos ---
-PC_ADMIN_IP = "10.0.0.143"
-CONTROL_PORT = 5050
-CHANNEL_PORT = 5051
+PC_ADMIN_IP = "10.0.0.59"    # IP de la PC administradora (control)
+CONTROL_PORT = 5050              # Puerto de control con la PC administradora
+CHANNEL_PORT = 5051              # Puerto por donde llegan los transmisores
 
-RECEIVER_IP = "10.0.0.243"
-RECEIVER_PORT = 5052
+RECEIVER_IP = "10.0.2.240"    # IP del receptor final
+RECEIVER_PORT = 5052             # Puerto del receptor
 
-MONITOR_IP = "10.0.1.255"
-MONITOR_PORT = 8100
+MONITOR_IP = "10.0.0.185"     # IP del monitor (puede ser broadcast)
+MONITOR_PORT = 8100              # Puerto del monitor
 
-# --- Estados ---
-pc_sock = None
-pc_lock = _thread.allocate_lock()
-modo_error = False
+# --- Estados globales ---
+pc_sock = None                    # Socket activo con la PC administradora
+pc_lock = _thread.allocate_lock() # Lock para acceso seguro a pc_sock entre hilos
+modo_error = False                # Bandera para activar/desactivar errores PAM4
 
 # --- Conexión WiFi ---
 wifi = network.WLAN(network.STA_IF)
@@ -35,42 +35,45 @@ while not wifi.isconnected():
     time.sleep(0.5)
 print("✅ Conectado a WiFi. IP local:", wifi.ifconfig()[0])
 
-# --- Función de error para símbolos PAM4 (0..3) ---
+# --- Función para introducir errores aleatorios en símbolos PAM4 ---
 def introducir_error(data):
-    # Probabilidad por byte de ser modificado (ajustable)
-    PROB = 0.10  # 10%
+    PROB = 0.10  # Probabilidad del 10% de error por símbolo
     try:
-        # Trabajamos sobre una copia mutable
-        b = bytearray(data)
+        b = bytearray(data)  # Convertimos a formato mutable
         for i in range(len(b)):
-            if b[i] in (0, 1, 2, 3):  # solo PAM4 válidos
-                if random.random() < PROB:
+            # Solo se modifican símbolos válidos PAM4 (0,1,2,3)
+            if b[i] in (0, 1, 2, 3):
+                if random.random() < PROB:  # Si cae dentro del 10%...
                     original = b[i]
+                    # Elegimos un valor distinto al original
                     opciones = [n for n in (0, 1, 2, 3) if n != original]
                     nuevo = random.choice(opciones)
                     b[i] = nuevo
                     print("⚠️ [ERROR] PAM4 modificado byte", i, ":", original, "->", nuevo)
-        return bytes(b)
+        return bytes(b)  # Devolvemos los datos con posibles errores
     except Exception as e:
         print("[WARN] introducir_error fallo:", e)
-        return data
+        return data  # Si algo falla, devolvemos los datos originales
 
-# --- Comunicación con PC administradora ---
+# --- Hilo cliente que mantiene comunicación con la PC administradora ---
 def pc_control_client():
     global pc_sock, modo_error
     while True:
         try:
+            # Conexión TCP hacia la PC administradora
             s = socket.socket()
             s.connect((PC_ADMIN_IP, CONTROL_PORT))
             with pc_lock:
                 pc_sock = s
             print("🖥️ Conectado con la PC administradora")
-            # Avisamos IP
+
+            # Enviar información de IP local del ESP32
             try:
                 s.sendall(("INFO:ESP_IP=" + wifi.ifconfig()[0] + "\n").encode())
             except:
                 pass
 
+            # Escuchar comandos de la PC (activar/desactivar error)
             while True:
                 data = s.recv(1024)
                 if not data:
@@ -86,22 +89,28 @@ def pc_control_client():
         except Exception as e:
             print("[❌] Error conexión con Admin:", e)
         finally:
+            # Si se pierde la conexión, se limpia el socket y se reintenta
             try:
                 s.close()
             except:
                 pass
             with pc_lock:
                 pc_sock = None
-            time.sleep(5)
+            time.sleep(5)  # Esperar antes de reconectar
 
-# --- Reenvío a cualquier IP:PORT ---
+# --- Función para reenviar datos binarios a otra ESP o dispositivo ---
 def reenviar_a_esp(msg_bytes, ip, port):
     try:
+        # Conexión TCP con destino
         c = socket.socket()
         c.connect((ip, port))
+
+        # 🔹 Envío directo de bytes (NO texto)
         c.sendall(msg_bytes)
         c.close()
-        print(f"[➡️] Reenviado a {ip}:{port}")
+        print(f"[➡️] Reenviado a {ip}:{port} (datos binarios)")
+
+        # Avisar a la PC administradora que se reenviaron los datos
         with pc_lock:
             if pc_sock:
                 try:
@@ -110,6 +119,7 @@ def reenviar_a_esp(msg_bytes, ip, port):
                     pass
     except Exception as e:
         print(f"[⚠️] No se pudo reenviar a {ip}:{port}: {e}")
+        # Informar error de reenvío a la PC administradora
         with pc_lock:
             if pc_sock:
                 try:
@@ -117,36 +127,38 @@ def reenviar_a_esp(msg_bytes, ip, port):
                 except:
                     pass
 
-# --- Servidor del canal (recibe transmisores) ---
+# --- Servidor del canal: recibe datos del transmisor ---
 def canal_server():
     s = socket.socket()
-    s.bind(('', CHANNEL_PORT))
+    s.bind(('', CHANNEL_PORT))  # Escucha en el puerto del canal
     s.listen(5)
     print(f"[📡] Esperando transmisores en puerto {CHANNEL_PORT}...")
+
     while True:
         try:
+            # Aceptar conexión entrante (transmisor)
             conn, addr = s.accept()
             print("[TX] Conexión desde", addr)
             try:
-                data = conn.recv(2048)
+                data = conn.recv(2048)  # Recibir datos PAM4 en binario
                 if not data:
                     conn.close()
                     continue
 
-                # Mostrar crudo en consola ESP
-                print("[TX] Mensaje recibido (crudo):", data)
+                # Mostrar mensaje original recibido (en formato hexadecimal)
+                print("[TX] Mensaje recibido (crudo):", " ".join(f"{b:02X}" for b in data))
 
-                # Aplicar error (sobre PAM4) si está activado
+                # Si el modo error está activo, se alteran los símbolos PAM4
                 msg_modulado = introducir_error(data) if modo_error else data
 
-                # Mostrar modulado en consola ESP
-                print("[TX] Mensaje modulado:", msg_modulado)
+                # Mostrar mensaje modificado
+                print("[TX] Mensaje modulado:", " ".join(f"{b:02X}" for b in msg_modulado))
 
-                # Reenviar modulado a receptor y monitor
+                # 🔹 Reenviar el mensaje (modificado o no) en BINARIO al receptor y al monitor
                 reenviar_a_esp(msg_modulado, RECEIVER_IP, RECEIVER_PORT)
                 reenviar_a_esp(msg_modulado, MONITOR_IP, MONITOR_PORT)
 
-                # Enviar ambos a PC administradora (original + modulado)
+                # También enviar a la PC administradora (solo para log, como texto)
                 with pc_lock:
                     if pc_sock:
                         try:
@@ -170,10 +182,10 @@ def canal_server():
             print("[Error aceptando conexión]:", e)
             time.sleep(0.05)
 
-# --- Lanzar hilos ---
-_thread.start_new_thread(pc_control_client, ())
-_thread.start_new_thread(canal_server, ())
+# --- Lanzar los hilos principales ---
+_thread.start_new_thread(pc_control_client, ())  # Hilo para hablar con la PC admin
+_thread.start_new_thread(canal_server, ())       # Hilo servidor que recibe transmisores
 
-# --- Mantener vivo ---
+# --- Bucle principal para mantener el programa vivo ---
 while True:
     time.sleep(1)
