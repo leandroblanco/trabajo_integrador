@@ -1,7 +1,7 @@
-# esp_intermedia_monitor.py - MicroPython para ESP32 (nodo intermedio)
+# esp_intermedia_monitor_persistente.py - MicroPython para ESP32 (nodo intermedio con histograma PAM4 persistente)
 
 import network
-import socket   # Un socket es como un "enchufe virtual" de red que permite la comunicación entre dispositivos.
+import socket
 import time
 import _thread
 import random
@@ -11,20 +11,24 @@ SSID = "UBP"
 PASSWORD = "pascal25"
 
 # --- IPs y puertos ---
-PC_ADMIN_IP = "10.0.0.59"    # IP de la PC administradora (control)
-CONTROL_PORT = 5050              # Puerto de control con la PC administradora
-CHANNEL_PORT = 5051              # Puerto por donde llegan los transmisores
-
-RECEIVER_IP = "10.0.2.240"    # IP del receptor final
-RECEIVER_PORT = 5052             # Puerto del receptor
-
-MONITOR_IP = "10.0.0.185"     # IP del monitor (puede ser broadcast)
-MONITOR_PORT = 8100              # Puerto del monitor
+PC_ADMIN_IP = "10.0.2.209"
+CONTROL_PORT = 5050
+CHANNEL_PORT = 5051
+RECEIVER_IP = "10.0.2.239"
+RECEIVER_PORT = 5052
+MONITOR_IP = "10.0.2.193"
+MONITOR_PORT = 8100
 
 # --- Estados globales ---
-pc_sock = None                    # Socket activo con la PC administradora
-pc_lock = _thread.allocate_lock() # Lock para acceso seguro a pc_sock entre hilos
-modo_error = False                # Bandera para activar/desactivar errores PAM4
+pc_sock = None
+pc_lock = _thread.allocate_lock()
+modo_error = False
+
+# --- Sockets persistentes ---
+receiver_sock = None
+monitor_sock = None
+receiver_lock = _thread.allocate_lock()
+monitor_lock = _thread.allocate_lock()
 
 # --- Conexión WiFi ---
 wifi = network.WLAN(network.STA_IF)
@@ -35,45 +39,57 @@ while not wifi.isconnected():
     time.sleep(0.5)
 print("✅ Conectado a WiFi. IP local:", wifi.ifconfig()[0])
 
-# --- Función para introducir errores aleatorios en símbolos PAM4 ---
-def introducir_error(data):
-    PROB = 0.10  # Probabilidad del 10% de error por símbolo
-    try:
-        b = bytearray(data)  # Convertimos a formato mutable
-        for i in range(len(b)):
-            # Solo se modifican símbolos válidos PAM4 (0,1,2,3)
-            if b[i] in (0, 1, 2, 3):
-                if random.random() < PROB:  # Si cae dentro del 10%...
-                    original = b[i]
-                    # Elegimos un valor distinto al original
-                    opciones = [n for n in (0, 1, 2, 3) if n != original]
-                    nuevo = random.choice(opciones)
-                    b[i] = nuevo
-                    print("⚠️ [ERROR] PAM4 modificado byte", i, ":", original, "->", nuevo)
-        return bytes(b)  # Devolvemos los datos con posibles errores
-    except Exception as e:
-        print("[WARN] introducir_error fallo:", e)
-        return data  # Si algo falla, devolvemos los datos originales
 
-# --- Hilo cliente que mantiene comunicación con la PC administradora ---
+# --- Decodificación PAM4 ---
+def decodificar_pam4(data):
+    simbolos = []
+    for b in data:
+        simbolos.append((b >> 6) & 0b11)
+        simbolos.append((b >> 4) & 0b11)
+        simbolos.append((b >> 2) & 0b11)
+        simbolos.append(b & 0b11)
+    return simbolos
+
+
+# --- Introducir errores aleatorios ---
+def introducir_error(simbolos):
+    PROB = 0.10
+    for i in range(len(simbolos)):
+        if random.random() < PROB:
+            original = simbolos[i]
+            opciones = [n for n in (0, 1, 2, 3) if n != original]
+            simbolos[i] = random.choice(opciones)
+            print("⚠️ [ERROR] PAM4 modificado símbolo", i, ":", original, "->", simbolos[i])
+    return simbolos
+
+
+# --- Reensamblar símbolos ---
+def empaquetar_pam4(simbolos):
+    b = bytearray()
+    for i in range(0, len(simbolos), 4):
+        grupo = simbolos[i:i+4]
+        while len(grupo) < 4:
+            grupo.append(0)
+        val = (grupo[0] << 6) | (grupo[1] << 4) | (grupo[2] << 2) | grupo[3]
+        b.append(val)
+    return bytes(b)
+
+
+# --- Hilo cliente persistente con la PC ---
 def pc_control_client():
     global pc_sock, modo_error
     while True:
         try:
-            # Conexión TCP hacia la PC administradora
             s = socket.socket()
             s.connect((PC_ADMIN_IP, CONTROL_PORT))
             with pc_lock:
                 pc_sock = s
             print("🖥️ Conectado con la PC administradora")
-
-            # Enviar información de IP local del ESP32
             try:
                 s.sendall(("INFO:ESP_IP=" + wifi.ifconfig()[0] + "\n").encode())
             except:
                 pass
 
-            # Escuchar comandos de la PC (activar/desactivar error)
             while True:
                 data = s.recv(1024)
                 if not data:
@@ -89,84 +105,140 @@ def pc_control_client():
         except Exception as e:
             print("[❌] Error conexión con Admin:", e)
         finally:
-            # Si se pierde la conexión, se limpia el socket y se reintenta
             try:
                 s.close()
             except:
                 pass
             with pc_lock:
                 pc_sock = None
-            time.sleep(5)  # Esperar antes de reconectar
+            time.sleep(5)
 
-# --- Función para reenviar datos binarios a otra ESP o dispositivo ---
-def reenviar_a_esp(msg_bytes, ip, port):
-    try:
-        # Conexión TCP con destino
-        c = socket.socket()
-        c.connect((ip, port))
 
-        # 🔹 Envío directo de bytes (NO texto)
-        c.sendall(msg_bytes)
-        c.close()
-        print(f"[➡️] Reenviado a {ip}:{port} (datos binarios)")
+# --- Clientes persistentes receptor y monitor ---
+def receptor_client():
+    global receiver_sock
+    while True:
+        try:
+            print("🔌 Conectando con el receptor...")
+            s = socket.socket()
+            s.connect((RECEIVER_IP, RECEIVER_PORT))
+            with receiver_lock:
+                receiver_sock = s
+            print("✅ Conectado con el receptor.")
+            while True:
+                time.sleep(1)
+                s.send(b'')  # mantener viva la conexión
+        except Exception as e:
+            print("[⚠️] Receptor desconectado:", e)
+        finally:
+            try:
+                s.close()
+            except:
+                pass
+            with receiver_lock:
+                receiver_sock = None
+            time.sleep(3)
 
-        # Avisar a la PC administradora que se reenviaron los datos
-        with pc_lock:
-            if pc_sock:
-                try:
-                    pc_sock.sendall(f"[OK] Reenviado a {ip}:{port}\n".encode())
-                except:
-                    pass
-    except Exception as e:
-        print(f"[⚠️] No se pudo reenviar a {ip}:{port}: {e}")
-        # Informar error de reenvío a la PC administradora
-        with pc_lock:
-            if pc_sock:
-                try:
-                    pc_sock.sendall(f"[ERROR] No se pudo reenviar a {ip}:{port}: {e}\n".encode())
-                except:
-                    pass
 
-# --- Servidor del canal: recibe datos del transmisor ---
+def monitor_client():
+    global monitor_sock
+    while True:
+        try:
+            print("📡 Conectando con el monitor...")
+            s = socket.socket()
+            s.connect((MONITOR_IP, MONITOR_PORT))
+            with monitor_lock:
+                monitor_sock = s
+            print("✅ Conectado con el monitor.")
+            while True:
+                time.sleep(1)
+                s.send(b'')
+        except Exception as e:
+            print("[⚠️] Monitor desconectado:", e)
+        finally:
+            try:
+                s.close()
+            except:
+                pass
+            with monitor_lock:
+                monitor_sock = None
+            time.sleep(3)
+
+
+# --- Enviar datos por conexiones persistentes ---
+def enviar_datos_persistentes(msg_bytes):
+    global receiver_sock, monitor_sock
+    # Receptor
+    with receiver_lock:
+        if receiver_sock:
+            try:
+                receiver_sock.sendall(msg_bytes)
+                print(f"[➡️] Enviado al receptor ({len(msg_bytes)} bytes)")
+            except Exception as e:
+                print("[⚠️] Error enviando al receptor:", e)
+                receiver_sock = None
+        else:
+            print("[⛔] Receptor no conectado")
+
+    # Monitor
+    with monitor_lock:
+        if monitor_sock:
+            try:
+                monitor_sock.sendall(msg_bytes)
+                print(f"[➡️] Enviado al monitor ({len(msg_bytes)} bytes)")
+            except Exception as e:
+                print("[⚠️] Error enviando al monitor:", e)
+                monitor_sock = None
+        else:
+            print("[⛔] Monitor no conectado")
+
+
+# --- Calcular histograma ---
+def histograma_pam4(simbolos):
+    counts = {0: 0, 1: 0, 2: 0, 3: 0}
+    for s in simbolos:
+        counts[s] += 1
+    total = len(simbolos)
+    print(f"\n📊 [HISTOGRAMA PAM4] Total: {total} símbolos")
+    for nivel in (0, 1, 2, 3):
+        print(f"   Nivel {nivel}: {counts[nivel]}")
+    print()
+
+
+# --- Servidor del canal ---
 def canal_server():
     s = socket.socket()
-    s.bind(('', CHANNEL_PORT))  # Escucha en el puerto del canal
+    s.bind(('', CHANNEL_PORT))
     s.listen(5)
     print(f"[📡] Esperando transmisores en puerto {CHANNEL_PORT}...")
 
     while True:
         try:
-            # Aceptar conexión entrante (transmisor)
             conn, addr = s.accept()
             print("[TX] Conexión desde", addr)
             try:
-                data = conn.recv(2048)  # Recibir datos PAM4 en binario
+                data = conn.recv(2048)
                 if not data:
                     conn.close()
                     continue
 
-                # Mostrar mensaje original recibido (en formato hexadecimal)
-                print("[TX] Mensaje recibido (crudo):", " ".join(f"{b:02X}" for b in data))
+                simbolos = decodificar_pam4(data)
+                print("[TX] Paquete recibido del transmisor.")
+                histograma_pam4(simbolos)
 
-                # Si el modo error está activo, se alteran los símbolos PAM4
-                msg_modulado = introducir_error(data) if modo_error else data
+                if modo_error:
+                    simbolos = introducir_error(simbolos)
+                    print("[TX] Paquete después de introducir errores:")
+                    histograma_pam4(simbolos)
 
-                # Mostrar mensaje modificado
-                print("[TX] Mensaje modulado:", " ".join(f"{b:02X}" for b in msg_modulado))
+                msg_modulado = empaquetar_pam4(simbolos)
 
-                # 🔹 Reenviar el mensaje (modificado o no) en BINARIO al receptor y al monitor
-                reenviar_a_esp(msg_modulado, RECEIVER_IP, RECEIVER_PORT)
-                reenviar_a_esp(msg_modulado, MONITOR_IP, MONITOR_PORT)
+                enviar_datos_persistentes(msg_modulado)
 
-                # También enviar a la PC administradora (solo para log, como texto)
                 with pc_lock:
                     if pc_sock:
                         try:
-                            pc_sock.sendall(b"CANAL (original): " + data + b"\n")
-                        except:
-                            pass
-                        try:
-                            pc_sock.sendall(b"CANAL (modulado): " + msg_modulado + b"\n")
+                            pc_sock.sendall(b"[INFO] Paquete PAM4 procesado\n")
                         except:
                             pass
 
@@ -177,15 +249,18 @@ def canal_server():
                     conn.close()
                 except:
                     pass
-
         except Exception as e:
             print("[Error aceptando conexión]:", e)
             time.sleep(0.05)
 
-# --- Lanzar los hilos principales ---
-_thread.start_new_thread(pc_control_client, ())  # Hilo para hablar con la PC admin
-_thread.start_new_thread(canal_server, ())       # Hilo servidor que recibe transmisores
 
-# --- Bucle principal para mantener el programa vivo ---
+# --- Lanzar hilos ---
+_thread.start_new_thread(pc_control_client, ())
+_thread.start_new_thread(canal_server, ())
+_thread.start_new_thread(receptor_client, ())
+_thread.start_new_thread(monitor_client, ())
+
+# --- Mantener vivo ---
 while True:
     time.sleep(1)
+
