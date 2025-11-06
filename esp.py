@@ -1,4 +1,4 @@
-# esp_intermedia_monitor_persistente.py - MicroPython para ESP32 (nodo intermedio con histograma PAM4 persistente)
+# esp_intermedia_monitor_persistente.py - MicroPython para ESP32 (nodo intermedio con sincronismo PAM4 persistente)
 
 import network
 import socket
@@ -30,6 +30,12 @@ monitor_sock = None
 receiver_lock = _thread.allocate_lock()
 monitor_lock = _thread.allocate_lock()
 
+# --- Prefijo "hola" en PAM4 (16 símbolos) ---
+PREFIJO_HOLA = [1, 2, 2, 0,
+                1, 2, 3, 3,
+                1, 2, 3, 0,
+                1, 2, 0, 1]
+
 # --- Conexión WiFi ---
 wifi = network.WLAN(network.STA_IF)
 wifi.active(True)
@@ -51,15 +57,28 @@ def decodificar_pam4(data):
     return simbolos
 
 
-# --- Introducir errores aleatorios ---
+# --- Introducir errores aleatorios (protegiendo el prefijo "hola") ---
 def introducir_error(simbolos):
     PROB = 0.10
-    for i in range(len(simbolos)):
+    total = len(simbolos)
+
+    # Verificar si el paquete contiene el prefijo al inicio
+    tiene_prefijo = (total >= 16 and simbolos[:16] == PREFIJO_HOLA)
+
+    if tiene_prefijo:
+        print("🟢 Prefijo 'hola' detectado — sincronismo correcto.")
+        inicio_datos = 16  # después del hola
+    else:
+        print("⚠️ Prefijo 'hola' NO detectado — se aplican errores a todo.")
+        inicio_datos = 0
+
+    for i in range(inicio_datos, total):
         if random.random() < PROB:
             original = simbolos[i]
             opciones = [n for n in (0, 1, 2, 3) if n != original]
             simbolos[i] = random.choice(opciones)
-            print("⚠️ [ERROR] PAM4 modificado símbolo", i, ":", original, "->", simbolos[i])
+            print(f"⚠️ [ERROR] símbolo {i}: {original} -> {simbolos[i]}")
+
     return simbolos
 
 
@@ -67,7 +86,7 @@ def introducir_error(simbolos):
 def empaquetar_pam4(simbolos):
     b = bytearray()
     for i in range(0, len(simbolos), 4):
-        grupo = simbolos[i:i+4]
+        grupo = simbolos[i:i + 4]
         while len(grupo) < 4:
             grupo.append(0)
         val = (grupo[0] << 6) | (grupo[1] << 4) | (grupo[2] << 2) | grupo[3]
@@ -75,7 +94,7 @@ def empaquetar_pam4(simbolos):
     return bytes(b)
 
 
-# --- Hilo cliente persistente con la PC ---
+# --- Cliente con la PC administradora ---
 def pc_control_client():
     global pc_sock, modo_error
     while True:
@@ -85,10 +104,7 @@ def pc_control_client():
             with pc_lock:
                 pc_sock = s
             print("🖥️ Conectado con la PC administradora")
-            try:
-                s.sendall(("INFO:ESP_IP=" + wifi.ifconfig()[0] + "\n").encode())
-            except:
-                pass
+            s.sendall(("INFO:ESP_IP=" + wifi.ifconfig()[0] + "\n").encode())
 
             while True:
                 data = s.recv(1024)
@@ -165,10 +181,10 @@ def monitor_client():
             time.sleep(3)
 
 
-# --- Enviar datos por conexiones persistentes ---
+# --- Enviar datos ---
 def enviar_datos_persistentes(msg_bytes):
     global receiver_sock, monitor_sock
-    # Receptor
+
     with receiver_lock:
         if receiver_sock:
             try:
@@ -180,7 +196,6 @@ def enviar_datos_persistentes(msg_bytes):
         else:
             print("[⛔] Receptor no conectado")
 
-    # Monitor
     with monitor_lock:
         if monitor_sock:
             try:
@@ -223,24 +238,21 @@ def canal_server():
                     continue
 
                 simbolos = decodificar_pam4(data)
-                print("[TX] Paquete recibido del transmisor.")
+                print(f"[TX] Paquete recibido ({len(simbolos)} símbolos).")
+
                 histograma_pam4(simbolos)
 
                 if modo_error:
                     simbolos = introducir_error(simbolos)
-                    print("[TX] Paquete después de introducir errores:")
-                    histograma_pam4(simbolos)
+                else:
+                    print("✅ Modo error desactivado (sin alteraciones).")
 
                 msg_modulado = empaquetar_pam4(simbolos)
-
                 enviar_datos_persistentes(msg_modulado)
 
                 with pc_lock:
                     if pc_sock:
-                        try:
-                            pc_sock.sendall(b"[INFO] Paquete PAM4 procesado\n")
-                        except:
-                            pass
+                        pc_sock.sendall(b"[INFO] Paquete PAM4 procesado\n")
 
             except Exception as e:
                 print("[Error canal interno]:", e)
