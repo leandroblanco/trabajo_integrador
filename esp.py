@@ -11,12 +11,12 @@ SSID = "UBP"
 PASSWORD = "pascal25"
 
 # --- IPs y puertos ---
-PC_ADMIN_IP = "10.0.2.209"
+PC_ADMIN_IP = "10.0.1.66"
 CONTROL_PORT = 5050
 CHANNEL_PORT = 5051
-RECEIVER_IP = "10.0.2.239"
+RECEIVER_IP = "10.0.1.62"
 RECEIVER_PORT = 5052
-MONITOR_IP = "10.0.2.193"
+MONITOR_IP = "10.0.1.173"
 MONITOR_PORT = 8100
 
 # --- Estados globales ---
@@ -57,22 +57,15 @@ def decodificar_pam4(data):
     return simbolos
 
 
-# --- Introducir errores aleatorios (protegiendo el prefijo "hola") ---
+# --- Introducir errores aleatorios (SIEMPRE protegidos los primeros 16 símbolos) ---
 def introducir_error(simbolos):
-    PROB = 0.10
+    PROB = 0.05
     total = len(simbolos)
 
-    # Verificar si el paquete contiene el prefijo al inicio
-    tiene_prefijo = (total >= 16 and simbolos[:16] == PREFIJO_HOLA)
+    # Nunca modificar los primeros 16 símbolos del paquete
+    limite_protegido = 16 if total >= 16 else total
 
-    if tiene_prefijo:
-        print("🟢 Prefijo 'hola' detectado — sincronismo correcto.")
-        inicio_datos = 16  # después del hola
-    else:
-        print("⚠️ Prefijo 'hola' NO detectado — se aplican errores a todo.")
-        inicio_datos = 0
-
-    for i in range(inicio_datos, total):
+    for i in range(limite_protegido, total):
         if random.random() < PROB:
             original = simbolos[i]
             opciones = [n for n in (0, 1, 2, 3) if n != original]
@@ -143,7 +136,7 @@ def receptor_client():
             print("✅ Conectado con el receptor.")
             while True:
                 time.sleep(1)
-                s.send(b'')  # mantener viva la conexión
+                s.send(b'')
         except Exception as e:
             print("[⚠️] Receptor desconectado:", e)
         finally:
@@ -240,6 +233,8 @@ def canal_server():
                 simbolos = decodificar_pam4(data)
                 print(f"[TX] Paquete recibido ({len(simbolos)} símbolos).")
 
+                print("Primeros 16 símbolos recibidos:", simbolos[:16])
+
                 histograma_pam4(simbolos)
 
                 if modo_error:
@@ -275,4 +270,3 @@ _thread.start_new_thread(monitor_client, ())
 # --- Mantener vivo ---
 while True:
     time.sleep(1)
-
