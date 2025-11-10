@@ -136,7 +136,7 @@ def receptor_client():
             print("✅ Conectado con el receptor.")
             while True:
                 time.sleep(1)
-                s.send(b'')
+                
         except Exception as e:
             print("[⚠️] Receptor desconectado:", e)
         finally:
@@ -161,7 +161,7 @@ def monitor_client():
             print("✅ Conectado con el monitor.")
             while True:
                 time.sleep(1)
-                s.send(b'')
+                
         except Exception as e:
             print("[⚠️] Monitor desconectado:", e)
         finally:
