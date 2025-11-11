@@ -157,7 +157,6 @@ python Monitor.py
 ```
 monitor-pam4/
 ├─ Monitor.py
-├─ requirements.txt
 └─ README.md
 ```
 
