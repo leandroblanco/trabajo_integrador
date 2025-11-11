@@ -163,18 +163,6 @@ monitor-pam4/
 
 ---
 
-## 🖼️ Imágenes en el README
-
-Podés **subir imágenes al mismo repo** y referenciarlas desde `README.md`:
-
-```md
-![Comparación de bins](img/plot_bins.png)
-```
-
-O usar **URLs externas** sin restricciones.
-
----
-
 ## 🩺 Troubleshooting
 
 - **No hay datos en gráficos**  
