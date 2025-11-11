@@ -1,0 +1,402 @@
+# ==========================
+# VISUALIZADOR V2.2 (Con Reconstrucción en Tiempo IFFT)
+# ==========================
+import sys
+import socket
+import threading
+import traceback
+from collections import deque
+from datetime import datetime
+
+import numpy as np
+from PyQt6 import QtCore, QtWidgets, QtGui
+import pyqtgraph as pg
+
+# ------------------------- # Configuración # -------------------------
+HEADER_SYMBOLS = [1, 2, 2, 0, 1, 2, 3, 3, 1, 2, 3, 0, 1, 2, 0, 1]
+
+# ------------------------- # Utilities & Decoder # -------------------------
+def pam_symbols_to_voltage(vals):
+    arr = np.array(vals, dtype=float)
+    if arr.size == 0: return arr
+    if np.nanmax(arr) <= 3:
+        map4 = {0: -3.0, 1: -1.0, 2: 1.0, 3: 3.0}
+        return np.array([map4.get(int(round(v)), 0.0) for v in arr], dtype=float)
+    return ((arr / 7.0) * 6.0) - 3.0
+
+def decode_256_symbols_to_64_8bit(values):
+    if len(values) < 256: return []
+    syms = values[:256]
+    bitstr = ''.join(format(int(s) & 0x3, '02b') for s in syms)
+    bins = []
+    for i in range(64):
+        chunk = bitstr[i*8:(i+1)*8]
+        if len(chunk) < 8: chunk = chunk.ljust(8, '0')
+        bins.append(int(chunk, 2))
+    return bins
+
+def find_latest_valid_frame(symbols):
+    sym_list = list(symbols)
+    h_len = len(HEADER_SYMBOLS)
+    t_len = h_len + 256
+    for i in range(len(sym_list) - t_len, -1, -1):
+        if sym_list[i] == HEADER_SYMBOLS[0]:
+            if sym_list[i : i+h_len] == HEADER_SYMBOLS:
+                return decode_256_symbols_to_64_8bit(sym_list[i+h_len : i+t_len]), i
+    return None, -1
+
+def unpack_bytes_to_symbols(data_bytes):
+    symbols = []
+    for b in data_bytes:
+        byte = int(b) & 0xFF
+        symbols.extend([(byte >> 6) & 0x3, (byte >> 4) & 0x3, (byte >> 2) & 0x3, byte & 0x3])
+    return symbols
+
+# ------------------------- # Server Thread # -------------------------
+class ServerThread(QtCore.QThread):
+    status = QtCore.pyqtSignal(str)
+    ip_assigned = QtCore.pyqtSignal(str, str)
+    message_text = QtCore.pyqtSignal(str, str, str)
+    message_raw = QtCore.pyqtSignal(str, str, list, int)
+    buffer_update = QtCore.pyqtSignal(str, str, list)
+
+    def __init__(self, port=8100, parent=None):
+        super().__init__(parent)
+        self.port = int(port)
+        self._stop_event = threading.Event()
+        self.sock = None
+        self.ip_to_tx = {}
+        self.lock = threading.Lock()
+        self.active_clients = []
+        self.clients_lock = threading.Lock()
+
+    def stop(self):
+        self._stop_event.set()
+        try:
+            if self.sock: self.sock.close()
+        except: pass
+        with self.clients_lock:
+            for conn in self.active_clients:
+                try: conn.close()
+                except: pass
+
+    def assign_tx_for_ip(self, ip):
+        with self.lock:
+            if ip in self.ip_to_tx: return self.ip_to_tx[ip], False
+            used = set(self.ip_to_tx.values())
+            for tx in ("TX1", "TX2", "TX3"):
+                if tx not in used:
+                    self.ip_to_tx[ip] = tx
+                    return tx, True
+            self.ip_to_tx[ip] = "TX1"
+            return "TX1", True
+
+    def run(self):
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.bind(("0.0.0.0", self.port))
+            self.sock.listen(8)
+            self.sock.settimeout(1.0)
+            self.status.emit(f"Escuchando en {self.port}")
+        except Exception as e:
+            self.status.emit(f"Error inicio: {e}"); return
+        while not self._stop_event.is_set():
+            try: conn, addr = self.sock.accept()
+            except socket.timeout: continue
+            except: break
+            ip = addr[0]; tx, newly = self.assign_tx_for_ip(ip)
+            if newly: self.ip_assigned.emit(tx, ip)
+            with self.clients_lock: self.active_clients.append(conn)
+            threading.Thread(target=self.client_handler, args=(conn, ip, tx), daemon=True).start()
+
+    def client_handler(self, conn, ip, tx):
+        self.status.emit(f"Conectado {ip}->{tx}")
+        conn.settimeout(2.0)
+        client_buffer = deque(maxlen=10000)
+        try:
+            while not self._stop_event.is_set():
+                try: data = conn.recv(4096)
+                except socket.timeout: continue
+                except: break
+                if not data: break
+                symbols = unpack_bytes_to_symbols(list(data))
+                if symbols: self.message_raw.emit(tx, ip, list(symbols[:50]), len(symbols))
+                client_buffer.extend(symbols)
+                self.buffer_update.emit(tx, ip, list(client_buffer))
+        finally:
+            with self.clients_lock:
+                if conn in self.active_clients: self.active_clients.remove(conn)
+            try: conn.close()
+            except: pass
+            self.status.emit(f"Desconectado {ip}")
+
+# ------------------------- # Ventanas Flotantes # -------------------------
+class ChatWindow(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("💬 Chat / Log")
+        self.resize(500, 600)
+        l = QtWidgets.QVBoxLayout(self)
+        self.chat = QtWidgets.QTextEdit(); self.chat.setReadOnly(True)
+        self.chat.setStyleSheet("background:#1a1a1a; color:#e0e0e0; font-family:Segoe UI; font-size:9pt;")
+        self.log = QtWidgets.QTextEdit(); self.log.setReadOnly(True)
+        self.log.setStyleSheet("background:#000; color:#90ee90; font-family:Consolas; font-size:8pt;")
+        l.addWidget(QtWidgets.QLabel("Mensajes:", styleSheet="font-weight:bold; color:#add8e6;")); l.addWidget(self.chat, 2)
+        l.addWidget(QtWidgets.QLabel("Sistema:", styleSheet="font-weight:bold; color:#ffebcd;")); l.addWidget(self.log, 1)
+    def add_c(self, t): self.chat.append(f"[{datetime.now().strftime('%H:%M:%S')}] {t}"); self.chat.verticalScrollBar().setValue(self.chat.verticalScrollBar().maximum())
+    def add_l(self, t): self.log.append(f"[{datetime.now().strftime('%H:%M:%S')}] {t}"); self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
+
+class LayersWindow(QtWidgets.QWidget):
+    def __init__(self, tx_c, cb):
+        super().__init__(); self.setWindowTitle("🗂 Capas"); self.setWindowFlags(QtCore.Qt.WindowType.WindowStaysOnTopHint)
+        l = QtWidgets.QVBoxLayout(self); self.cbs = {}
+        for tx in ["TX1","TX2","TX3"]:
+            c = QtWidgets.QCheckBox(tx); c.setChecked(True); c.setStyleSheet(f"color:{tx_c.get(tx,'#fff')}; font-weight:bold;")
+            c.toggled.connect(lambda s,t=tx: cb(t,s)); l.addWidget(c); self.cbs[tx] = c
+    def upd_c(self, tx_c):
+        for tx, c in self.cbs.items(): c.setStyleSheet(f"color:{tx_c.get(tx,'#fff')}; font-weight:bold;")
+
+# ------------------------- # Pestaña Reconstrucción IFFT (NUEVA) # -------------------------
+class ReconstructedSignalTab(QtWidgets.QWidget):
+    def __init__(self, get_c, is_v, get_n):
+        super().__init__()
+        self.get_c, self.is_v, self.get_n = get_c, is_v, get_n
+        layout = QtWidgets.QVBoxLayout(self)
+        self.plots, self.curves = {}, {}
+        # Creamos 3 gráficos apilados
+        for tx in ["TX1", "TX2", "TX3"]:
+            p = pg.PlotWidget(title=f"Señal Reconstruida {tx}")
+            p.setBackground('k'); p.showGrid(x=True, y=True, alpha=0.3)
+            p.setLabel('bottom', 'Tiempo (s)'); p.setLabel('left', 'Amplitud')
+            p.setXRange(0, 0.020) # Zoom inicial de 20ms como solicitado
+            layout.addWidget(p)
+            self.plots[tx] = p
+            self.curves[tx] = p.plot(pen=pg.mkPen(self.get_c(tx), width=2))
+
+    def update_signal(self, tx, bins):
+        if not self.is_v(tx):
+             self.curves[tx].clear(); return
+        
+        # --- Reconstrucción IFFT (igual al Transmisor) ---
+        fs = 44100; dur = 0.1; N = int(fs * dur)
+        spectrum = np.zeros(N, dtype=complex)
+        for i, amp in enumerate(bins):
+            freq = (i + 1) * 100
+            idx = int(freq * dur)
+            if idx < N: spectrum[idx] = float(amp) + 0j
+        
+        signal = np.fft.ifft(spectrum).real
+        t = np.linspace(0, dur, N, endpoint=False)
+        # -------------------------------------------------
+        
+        c = QtGui.QColor(self.get_c(tx))
+        self.curves[tx].setPen(pg.mkPen(c, width=2))
+        self.curves[tx].setData(t, signal)
+        # Actualizar título con nombre si cambió
+        self.plots[tx].setTitle(f"Señal Reconstruida {self.get_n(tx)}")
+
+# ------------------------- # Otras Pestañas # -------------------------
+class PAM4ValuesTab(QtWidgets.QWidget):
+    def __init__(self, gc, iv, gn):
+        super().__init__(); self.gc, self.iv = gc, iv
+        self.v = {t:deque(maxlen=2000) for t in ["TX1","TX2","TX3"]}; self.c = {t:[0]*8 for t in ["TX1","TX2","TX3"]}
+        self.m = QtWidgets.QComboBox(); self.m.addItems(["Secuencia","Histograma"]); self.m.currentTextChanged.connect(lambda:self.upd())
+        b = QtWidgets.QPushButton("Reset"); b.clicked.connect(self.rst)
+        h = QtWidgets.QHBoxLayout(); h.addWidget(QtWidgets.QLabel("Modo:")); h.addWidget(self.m); h.addStretch(); h.addWidget(b)
+        self.p = pg.PlotWidget(); self.p.setBackground('k'); self.p.showGrid(x=True,y=True,alpha=0.3)
+        l = QtWidgets.QVBoxLayout(self); l.addLayout(h); l.addWidget(self.p)
+    def rst(self):
+        for t in self.v: self.v[t].clear(); self.c[t] = [0]*8
+        self.upd()
+    def add(self, tx, val):
+        vi = max(0, min(7, int(val))); self.v[tx].append(vi); self.c[tx][vi] += 1
+        self.upd()
+    def upd(self):
+        try:
+            self.p.clear(); mo = self.m.currentText(); o = {"TX1":-0.2,"TX2":0,"TX3":0.2}
+            for tx in ["TX1","TX2","TX3"]:
+                if not self.iv(tx): continue
+                qc = QtGui.QColor(self.gc(tx)); c = (qc.red(),qc.green(),qc.blue())
+                if "Histo" in mo: self.p.addItem(pg.BarGraphItem(x=np.arange(8)+o[tx], height=self.c[tx], width=0.15, brush=pg.mkBrush(c+(200,))))
+                else:
+                    d = list(self.v[tx]); N=len(d); M=min(300,N)
+                    if M>0: x=np.arange(N-M,N)+o[tx]; self.p.addItem(pg.ScatterPlotItem(x, np.array(d[-M:]), size=6, brush=pg.mkBrush(c)))
+        except: pass
+
+class MagnitudesTab(QtWidgets.QWidget):
+    def __init__(self, gc, iv, gn):
+        super().__init__(); self.gc, self.iv = gc, iv
+        self.l = {t:np.zeros(64) for t in ["TX1","TX2","TX3"]}
+        self.p = pg.PlotWidget(); self.p.setBackground('k'); self.p.showGrid(x=True,y=True,alpha=0.2)
+        self.p.setLabel('bottom','Índice Frec (0-63)'); self.p.setYRange(0,260); self.p.setXRange(-1,65)
+        self.p.getAxis('bottom').setTickSpacing(5,1)
+        l = QtWidgets.QVBoxLayout(self); l.addWidget(self.p)
+    def upd(self, tx, d): self.l[tx] = np.array(d, dtype=float); self.ref()
+    def ref(self):
+        self.p.clear(); idx = np.arange(64); o = {"TX1":-0.3,"TX2":0,"TX3":0.3}
+        for tx in ["TX1","TX2","TX3"]:
+            if self.iv(tx):
+                c = QtGui.QColor(self.gc(tx))
+                self.p.addItem(pg.BarGraphItem(x=idx+o[tx], height=self.l[tx], width=0.28, brush=pg.mkBrush(c.red(),c.green(),c.blue(),230)))
+
+class TextDumpTab(QtWidgets.QWidget): # Para Raw, Bits, Bins (misma lógica base)
+    def __init__(self, title):
+        super().__init__()
+        l = QtWidgets.QVBoxLayout(self); l.addWidget(QtWidgets.QLabel(title))
+        self.t = QtWidgets.QTextEdit(); self.t.setReadOnly(True); self.t.setFont(QtGui.QFont("Consolas",9))
+        self.t.setLineWrapMode(QtWidgets.QTextEdit.LineWrapMode.WidgetWidth)
+        l.addWidget(self.t); self.d = {t:deque(maxlen=2000) for t in ["TX1","TX2","TX3"]}
+        self.tm = QtCore.QTimer(self); self.tm.timeout.connect(self.ref); self.tm.start(500)
+    def add(self, tx, data): self.d[tx].extend(data)
+    def set_d(self, tx, data): self.d[tx] = data # Para bins que reemplazan todo
+    def ref(self): pass # Implementado en subclases
+
+class RawDataTab(TextDumpTab):
+    def __init__(self): super().__init__("Símbolos PAM4 RAW (HEX):")
+    def ref(self):
+        txt = []
+        for tx in ["TX1","TX2","TX3"]:
+            if self.d[tx]: txt.append(f"--- {tx} ---\n{''.join(f'{s:X}' for s in list(self.d[tx])[-400:])}\n\n")
+        self.t.setText("".join(txt))
+
+class BitStreamTab(TextDumpTab):
+    def __init__(self): super().__init__("Bits Demodulados:")
+    def ref(self):
+        txt = []
+        for tx in ["TX1","TX2","TX3"]:
+            if self.d[tx]:
+                bits = ''.join(f'{int(v)&3:02b}' for v in list(self.d[tx])[-600:])
+                txt.append(f"--- {tx} ---\n{' '.join(bits[i:i+8] for i in range(0,len(bits),8))}\n\n")
+        self.t.setText("".join(txt))
+
+class DecodedBinsTab(TextDumpTab):
+    def __init__(self): super().__init__("Bins Decodificados (0-255):")
+    def add(self, tx, data): self.d[tx] = data # Override para guardar solo el último frame
+    def ref(self):
+        txt = []
+        for tx in ["TX1","TX2","TX3"]:
+            if self.d[tx] and len(self.d[tx])==64:
+                txt.append(f"--- {tx} ---\n[{', '.join(f'{b:3d}' for b in self.d[tx])}]\n\n")
+        self.t.setText("".join(txt))
+
+class HeaderSyncTab(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        l = QtWidgets.QVBoxLayout(self); self.lbls = {}
+        for tx in ["TX1","TX2","TX3"]:
+            lb = QtWidgets.QLabel(f"{tx}: Esperando..."); lb.setStyleSheet("color:gray; font-size:11pt;")
+            l.addWidget(lb); self.lbls[tx] = lb
+        self.t = QtWidgets.QTextEdit(); self.t.setReadOnly(True); self.t.setFont(QtGui.QFont("Consolas",9))
+        l.addWidget(QtWidgets.QLabel("Buffer cerca de cabecera:")); l.addWidget(self.t)
+        self.buf = {t:deque(maxlen=1000) for t in ["TX1","TX2","TX3"]}
+        self.tm = QtCore.QTimer(self); self.tm.timeout.connect(self.ref); self.tm.start(500)
+    def add(self, tx, d): self.buf[tx].extend(d)
+    def ref(self):
+        txt = []
+        for tx in ["TX1","TX2","TX3"]:
+            s = list(self.buf[tx])
+            if not s: continue
+            _, idx = find_latest_valid_frame(s)
+            if idx >= 0:
+                self.lbls[tx].setText(f"{tx}: ¡SYNC OK! (idx {idx})"); self.lbls[tx].setStyleSheet("color:#90ee90; font-weight:bold; font-size:11pt;")
+                start=max(0,idx-8); end=min(len(s),idx+24); frag=s[start:end]
+                marked = [(f"[{v}]" if idx<=start+i<idx+16 else str(v)) for i,v in enumerate(frag)]
+                txt.append(f"{tx} SYNC:\n... {' '.join(marked)} ...\n\n")
+            else:
+                self.lbls[tx].setText(f"{tx}: Buscando..."); self.lbls[tx].setStyleSheet("color:orange; font-size:11pt;")
+        self.t.setText("".join(txt))
+
+# ------------------------- # MainWindow # -------------------------
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Analizador Triple V2.2 - Full + IFFT")
+        self.resize(1400, 950)
+        self.tc = {"TX1":"#f00","TX2":"#0f0","TX3":"#0af"}
+        self.tv = {"TX1":True,"TX2":True,"TX3":True}
+        self.tn = {"TX1":"TX1","TX2":"TX2","TX3":"TX3"}
+
+        w = QtWidgets.QWidget(); self.setCentralWidget(w); ml = QtWidgets.QVBoxLayout(w)
+        top = QtWidgets.QHBoxLayout(); ml.addLayout(top)
+        for tx in ["TX1","TX2","TX3"]:
+            g = QtWidgets.QGroupBox(tx); g.setStyleSheet(f"QGroupBox{{font-weight:bold; color:{self.tc[tx]};}}"); gl = QtWidgets.QVBoxLayout(g); top.addWidget(g)
+            h1=QtWidgets.QHBoxLayout(); h1.addWidget(QtWidgets.QLabel("Nom:")); le=QtWidgets.QLineEdit(self.tn[tx]); le.editingFinished.connect(lambda t=tx,e=le:self.sn(t,e.text())); h1.addWidget(le); gl.addLayout(h1)
+            l_ip=QtWidgets.QLabel("IP: -"); gl.addWidget(l_ip); setattr(self,f"ip_{tx}",l_ip)
+            h2=QtWidgets.QHBoxLayout(); bc=QtWidgets.QPushButton("Color"); bc.clicked.connect(lambda _,t=tx:self.sc(t)); h2.addWidget(bc)
+            cv=QtWidgets.QCheckBox("Ver"); cv.setChecked(True); cv.toggled.connect(lambda s,t=tx:self.sv(t,s)); h2.addWidget(cv); gl.addLayout(h2)
+
+        cl = QtWidgets.QHBoxLayout(); ml.addLayout(cl)
+        self.dm=QtWidgets.QCheckBox("Demod TX1"); self.dm.setChecked(True); cl.addWidget(self.dm); cl.addStretch()
+        cl.addWidget(QtWidgets.QLabel("Puerto:")); self.sp=QtWidgets.QSpinBox(); self.sp.setRange(1,65535); self.sp.setValue(8100); cl.addWidget(self.sp)
+        self.b1=QtWidgets.QPushButton("▶ Inicio"); self.b1.clicked.connect(self.start); cl.addWidget(self.b1)
+        self.b2=QtWidgets.QPushButton("⏹ Stop"); self.b2.setEnabled(False); self.b2.clicked.connect(self.stop); cl.addWidget(self.b2)
+        self.fc=QtWidgets.QCheckBox("IGNORAR 'hola'"); cl.addWidget(self.fc); cl.addStretch()
+        b_ch=QtWidgets.QPushButton("💬 Chat"); b_ch.clicked.connect(lambda:self.chat.show()); cl.addWidget(b_ch)
+        b_ly=QtWidgets.QPushButton("🗂 Capas"); b_ly.clicked.connect(lambda:self.lay.show()); cl.addWidget(b_ly)
+
+        self.tabs = QtWidgets.QTabWidget(); ml.addWidget(self.tabs)
+        self.t_ti = pg.PlotWidget(); self.t_ti.showGrid(x=True,y=True,alpha=0.3); self.tabs.addTab(self.t_ti,"Tiempo")
+        self.curv = {tx: self.t_ti.plot(pen=pg.mkPen(self.tc[tx], width=2), name=tx) for tx in self.tc}
+        
+        self.tb_pam = PAM4ValuesTab(self.gc,self.gv,self.gn); self.tabs.addTab(self.tb_pam,"PAM4 Values")
+        self.tb_mag = MagnitudesTab(self.gc,self.gv,self.gn); self.tabs.addTab(self.tb_mag,"Magnitudes 64")
+        self.tb_rec = ReconstructedSignalTab(self.gc,self.gv,self.gn); self.tabs.addTab(self.tb_rec,"Reconstrucción (IFFT)") # NUEVA PESTAÑA
+        self.tb_raw = RawDataTab(); self.tabs.addTab(self.tb_raw,"Raw Data")
+        self.tb_bit = BitStreamTab(); self.tabs.addTab(self.tb_bit,"Bit Stream")
+        self.tb_syn = HeaderSyncTab(); self.tabs.addTab(self.tb_syn,"Header Sync")
+        self.tb_bin = DecodedBinsTab(); self.tabs.addTab(self.tb_bin,"Decoded Bins")
+
+        self.chat = ChatWindow(); self.lay = LayersWindow(self.tc, self.sv_lay); self.srv = None
+
+    def gc(self,t): return self.tc.get(t,"#fff")
+    def gv(self,t): return self.tv.get(t,True)
+    def gn(self,t): return self.tn.get(t,t)
+    def sn(self,t,n): self.tn[t]=n
+    def sc(self,t):
+        c = QtWidgets.QColorDialog.getColor()
+        if c.isValid():
+            self.tc[t]=c.name(); self.curv[t].setPen(c.name(),width=2); self.lay.upd_c(self.tc)
+            self.tb_pam.upd(); self.tb_mag.ref()
+            # Actualizar color de grupo
+            for i in range(self.centralWidget().layout().itemAt(0).layout().count()):
+                 it = self.centralWidget().layout().itemAt(0).layout().itemAt(i)
+                 if it.widget() and isinstance(it.widget(),QtWidgets.QGroupBox) and it.widget().title()==t:
+                     it.widget().setStyleSheet(f"QGroupBox{{font-weight:bold; color:{c.name()};}}")
+    def sv(self,t,s): self.tv[t]=s; self.curv[t].setVisible(s); self.tb_pam.upd(); self.tb_mag.ref();
+    def sv_lay(self,t,s): self.sv(t,s) # Simplificado, actualizar checkbox principal si se quiere perfección
+
+    def start(self):
+        if self.srv: return
+        self.srv = ServerThread(self.sp.value())
+        self.srv.status.connect(self.chat.add_l); self.srv.ip_assigned.connect(self.on_ip)
+        self.srv.message_text.connect(lambda t,i,x: self.chat.add_c(f"[{self.gn(t)}] {x}"))
+        self.srv.buffer_update.connect(self.on_data)
+        self.srv.start(); self.b1.setEnabled(False); self.b2.setEnabled(True)
+    def stop(self):
+        if self.srv: self.srv.stop(); self.srv.wait(3000); self.srv = None
+        self.b1.setEnabled(True); self.b2.setEnabled(False); self.chat.add_l("Servidor detenido")
+    @QtCore.pyqtSlot(str,str)
+    def on_ip(self,t,i): getattr(self,f"ip_{t}").setText(f"IP: {i}"); self.chat.add_l(f"Asignado {t}->{i}")
+    @QtCore.pyqtSlot(str,str,list)
+    def on_data(self, tx, ip, syms):
+        arr = np.array(syms, dtype=float); disp = arr[-1000:] if arr.size>1000 else arr
+        y = pam_symbols_to_voltage(disp) if (tx=="TX1" and self.dm.isChecked()) else disp
+        if self.tv[tx]: self.curv[tx].setData(y)
+        else: self.curv[tx].clear()
+
+        self.tb_raw.add(tx, syms); self.tb_bit.add(tx, syms); self.tb_syn.add(tx, syms)
+        if syms: self.tb_pam.add(tx, syms[-1])
+        
+        bins, _ = find_latest_valid_frame(syms)
+        if bins:
+            self.tb_mag.upd(tx, bins); self.tb_bin.add(tx, bins)
+            self.tb_rec.update_signal(tx, bins) # Actualizar señal reconstruida
+        elif self.fc.isChecked() and len(syms)>=256:
+            fb = decode_256_symbols_to_64_8bit(syms[-256:])
+            self.tb_mag.upd(tx, fb); self.tb_bin.add(tx, fb); self.tb_rec.update_signal(tx, fb)
+    def closeEvent(self,e): self.stop(); self.chat.close(); self.lay.close(); e.accept()
+
+if __name__ == "__main__":
+    app = QtWidgets.QApplication(sys.argv); pg.setConfigOptions(antialias=True, background='k', foreground='w')
+    win = MainWindow(); win.show(); sys.exit(app.exec())
